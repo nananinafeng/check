@@ -1,0 +1,42 @@
+# templates/build-image-step.yml
+parameters:
+- name: imageName
+  type: string
+- name: buildImage
+  type: string
+  default: 'false'
+- name: dockerRegistryServiceConnection
+  type: string
+- name: containerRegistry
+  type: string
+- name: gitTag
+  type: string
+- name: buildArgs
+  type: string
+  default: ''
+
+steps:
+# 只有当对应的 BUILD_XXX 变量为 true 时才执行该组的所有 Task
+- ${{ if eq(parameters.buildImage, 'true') }}:
+
+  # 1. Build and Push
+  - task: Docker@2
+    displayName: "Build and Push ${{ parameters.imageName }}"
+    inputs:
+      command: buildAndPush
+      containerRegistry: '${{ parameters.dockerRegistryServiceConnection }}'
+      repository: '${{ parameters.imageName }}'
+      dockerfile: '${{ parameters.imageName }}/Dockerfile'
+      buildArguments: '${{ parameters.buildArgs }}'
+      tags: '${{ parameters.gitTag }}'
+
+  # 2. Trivy 安全扫描
+  - script: |
+      echo "==> Running Trivy scan on ${{ parameters.containerRegistry }}/${{ parameters.imageName }}:${{ parameters.gitTag }}"
+      trivy image --exit-code 0 --severity HIGH,CRITICAL ${{ parameters.containerRegistry }}/${{ parameters.imageName }}:${{ parameters.gitTag }}
+    displayName: "Trivy Scan ${{ parameters.imageName }}"
+
+  # 3. Publish (如：生成并上传 SBOM / 资产清单)
+  - script: |
+      echo "==> Publishing artifacts/manifest for ${{ parameters.imageName }}"
+    displayName: "Publish Metadata for ${{ parameters.imageName }}"

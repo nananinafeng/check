@@ -1,0 +1,180 @@
+trigger:
+  branches:
+    include:
+      - release-2.*
+      - release-3.*
+  tags:
+    include:
+      - release-*
+
+variables:
+  devAcrServiceConnection: 'acr-dev-connection'
+  devRegistry: 'mycompanydev.azurecr.io'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: Build_DEV
+  displayName: "Build and Push to DEV ACR"
+  jobs:
+  - job: BuildJob
+    displayName: "Build Changed Images"
+    steps:
+    - checkout: self
+      fetchDepth: 0
+
+    # Task 1: 检测变动并生成各个镜像的标志与 Tag
+    - task: AzureCLI@2
+      name: DetectChanges
+      displayName: "Detect File Changes & Resolve Tags"
+      inputs:
+        azureSubscription: '$(devAcrServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -e
+          GIT_TAG=$(git describe --tags --always)
+          BRANCH_PREFIX=$(Build.SourceBranchName)
+
+          echo "##vso[task.setvariable variable=GIT_TAG]$GIT_TAG"
+          echo "##vso[task.setvariable variable=GIT_TAG;isoutput=true]$GIT_TAG"
+
+          get_latest_acr_tag() {
+            local img_name=$1
+            local tag=$(az acr repository show-tags --name $(devRegistry) --repository $img_name \
+              --query "[?starts_with(@, '$BRANCH_PREFIX')] | [-1]" -o tsv)
+            if [ -z "$tag" ]; then echo "latest"; else echo "$tag"; fi
+          }
+
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+
+          # 变更判断辅助函数
+          is_changed() { echo "$CHANGED_FILES" | grep -q "^$1/" && echo "true" || echo "false"; }
+
+          # 1. 独立镜像（无依赖）
+          echo "##vso[task.setvariable variable=BUILD_HUB]$(is_changed hubimage)"
+          echo "##vso[task.setvariable variable=BUILD_ADMIN]$(is_changed adminimage)"
+          echo "##vso[task.setvariable variable=BUILD_DB]$(is_changed databaseimage)"
+
+          # 2. 存在拓扑依赖的镜像级联判断
+          BASE_C=$(is_changed baseimage)
+          MINIMAL_C=$(is_changed minimalimage)
+          SCIPY_C=$(is_changed scipyimage)
+
+          # Base Image
+          if [ "$BASE_C" = "true" ]; then
+            echo "##vso[task.setvariable variable=BUILD_BASE]true"
+            BASE_TAG="$GIT_TAG"
+          else
+            echo "##vso[task.setvariable variable=BUILD_BASE]false"
+            BASE_TAG=$(get_latest_acr_tag "baseimage")
+          fi
+          echo "##vso[task.setvariable variable=BASE_TAG]$BASE_TAG"
+
+          # Minimal Image
+          if [ "$BASE_C" = "true" ] || [ "$MINIMAL_C" = "true" ]; then
+            echo "##vso[task.setvariable variable=BUILD_MINIMAL]true"
+            MINIMAL_TAG="$GIT_TAG"
+          else
+            echo "##vso[task.setvariable variable=BUILD_MINIMAL]false"
+            MINIMAL_TAG=$(get_latest_acr_tag "minimalimage")
+          fi
+          echo "##vso[task.setvariable variable=MINIMAL_TAG]$MINIMAL_TAG"
+
+          # R & Scipy
+          if [ "$BASE_C" = "true" ] || [ "$MINIMAL_C" = "true" ] || [ "$(is_changed rimage)" = "true" ]; then
+            echo "##vso[task.setvariable variable=BUILD_R]true"
+          else
+            echo "##vso[task.setvariable variable=BUILD_R]false"
+          fi
+
+          if [ "$BASE_C" = "true" ] || [ "$MINIMAL_C" = "true" ] || [ "$SCIPY_C" = "true" ]; then
+            echo "##vso[task.setvariable variable=BUILD_SCIPY]true"
+            SCIPY_TAG="$GIT_TAG"
+          else
+            echo "##vso[task.setvariable variable=BUILD_SCIPY]false"
+            SCIPY_TAG=$(get_latest_acr_tag "scipyimage")
+          fi
+          echo "##vso[task.setvariable variable=SCIPY_TAG]$SCIPY_TAG"
+
+          # Tensorflow
+          if [ "$BASE_C" = "true" ] || [ "$MINIMAL_C" = "true" ] || [ "$SCIPY_C" = "true" ] || [ "$(is_changed tensorflowimage)" = "true" ]; then
+            echo "##vso[task.setvariable variable=BUILD_TF]true"
+          else
+            echo "##vso[task.setvariable variable=BUILD_TF]false"
+          fi
+
+    # -----------------------------------------------------------------
+    # 使用 Step Template 批量调用所有镜像构建（按拓扑构建顺序列出）
+    # -----------------------------------------------------------------
+
+    # 独立镜像组 (无依赖，随时构建)
+    - template: templates/build-image-step.yml
+      parameters:
+        imageName: 'hubimage'
+        buildImage: $(BUILD_HUB)
+        dockerRegistryServiceConnection: $(devAcrServiceConnection)
+        containerRegistry: $(devRegistry)
+        gitTag: $(GIT_TAG)
+
+    - template: templates/build-image-step.yml
+      parameters:
+        imageName: 'adminimage'
+        buildImage: $(BUILD_ADMIN)
+        dockerRegistryServiceConnection: $(devAcrServiceConnection)
+        containerRegistry: $(devRegistry)
+        gitTag: $(GIT_TAG)
+
+    - template: templates/build-image-step.yml
+      parameters:
+        imageName: 'databaseimage'
+        buildImage: $(BUILD_DB)
+        dockerRegistryServiceConnection: $(devAcrServiceConnection)
+        containerRegistry: $(devRegistry)
+        gitTag: $(GIT_TAG)
+
+    # 有继承关系的镜像链 (顺序：base -> minimal -> r / scipy -> tensorflow)
+    - template: templates/build-image-step.yml
+      parameters:
+        imageName: 'baseimage'
+        buildImage: $(BUILD_BASE)
+        dockerRegistryServiceConnection: $(devAcrServiceConnection)
+        containerRegistry: $(devRegistry)
+        gitTag: $(GIT_TAG)
+
+    - template: templates/build-image-step.yml
+      parameters:
+        imageName: 'minimalimage'
+        buildImage: $(BUILD_MINIMAL)
+        dockerRegistryServiceConnection: $(devAcrServiceConnection)
+        containerRegistry: $(devRegistry)
+        gitTag: $(GIT_TAG)
+        buildArgs: "REGISTRY=$(devRegistry)\nBASE_IMAGE_TAG=$(BASE_TAG)"
+
+    - template: templates/build-image-step.yml
+      parameters:
+        imageName: 'rimage'
+        buildImage: $(BUILD_R)
+        dockerRegistryServiceConnection: $(devAcrServiceConnection)
+        containerRegistry: $(devRegistry)
+        gitTag: $(GIT_TAG)
+        buildArgs: "REGISTRY=$(devRegistry)\nMINIMAL_IMAGE_TAG=$(MINIMAL_TAG)"
+
+    - template: templates/build-image-step.yml
+      parameters:
+        imageName: 'scipyimage'
+        buildImage: $(BUILD_SCIPY)
+        dockerRegistryServiceConnection: $(devAcrServiceConnection)
+        containerRegistry: $(devRegistry)
+        gitTag: $(GIT_TAG)
+        buildArgs: "REGISTRY=$(devRegistry)\nMINIMAL_IMAGE_TAG=$(MINIMAL_TAG)"
+
+    - template: templates/build-image-step.yml
+      parameters:
+        imageName: 'tensorflowimage'
+        buildImage: $(BUILD_TF)
+        dockerRegistryServiceConnection: $(devAcrServiceConnection)
+        containerRegistry: $(devRegistry)
+        gitTag: $(GIT_TAG)
+        buildArgs: "REGISTRY=$(devRegistry)\nSCIPY_IMAGE_TAG=$(SCIPY_TAG)"
